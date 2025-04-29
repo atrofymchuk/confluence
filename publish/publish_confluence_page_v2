@@ -1,0 +1,162 @@
+#!/usr/bin/env python2
+""" Get page in csv format from stdin and post it to specified page on Confluence
+"""
+
+import sys
+import requests
+import argparse
+import csv
+import logging
+from requests.auth import HTTPBasicAuth
+
+# Parse commandline options and generate object with configuration in its attributes.
+def parse_args():
+    parser = argparse.ArgumentParser(description="Publish or update confluence page")
+    parser.add_argument(
+        '--confluence_url', '-u', type=str, required=True,
+        help='URL to confluence REST API.')
+    parser.add_argument(
+        '--page_title', '-p', type=str, required=True,
+        help='Title of page on confluence')
+    parser.add_argument(
+        '--file', '-f', required=True, help="Path to the file containing the content")
+    parser.add_argument(
+        '--email', '-e', type=str, required=True,
+        help='Email of system user in Confluence')
+    parser.add_argument(
+        '--token', '-t', type=str, required=True,
+        help='Token of system user in Confluence')
+    parser.add_argument(
+        '--debug', '-d', action="store_true", help='Enable debug logging')
+
+    if 'nosetests' in sys.argv[0]:  # Prevent parsing args during testing
+        return None
+    return parser.parse_args()
+
+args = parse_args()
+
+logging.basicConfig(
+    level=logging.DEBUG if args.debug else logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler()]
+)
+
+logger = logging.getLogger(__name__)
+
+
+def get_page_id(title, confluence_url, auth):
+    """
+    Get page ID and version using REST API v2
+    """
+    endpoint = "{}/api/v2/pages".format(confluence_url)
+    params = {"title": title, "expand": "version"}
+    logging.debug("Sending request to {} with params {}".format(endpoint, params))
+    response = requests.get(endpoint, params=params, auth=auth)
+    # Check for errors
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        logger.error("HTTP Error: {}".format(err))
+        logger.error("Response content: {}".format(response.text))
+        raise
+    data = response.json()
+    results = data.get("results", [])
+    if not results:
+        raise ValueError("No page found with title: '{}'".format(title))
+    # Extract page ID and version
+    page_id = results[0].get("id")
+    version_number = results[0].get("version", {}).get("number")
+    if not page_id or not version_number:
+        raise ValueError("Failed to parse page ID or version from the API response")
+    return page_id, version_number
+
+
+def update_page(page_id, current_version, new_content, confluence_url):
+    """
+    Update page using REST API v2
+    """
+    endpoint = "{}/api/v2/pages/{}".format(confluence_url, page_id)
+    payload = {
+        # Required: Page ID
+        "id": page_id,
+        # Required: Page status (e.g., "current" for published pages)
+        "status": "current",
+        "version": {
+            # Increment version number
+            "number": current_version + 1,
+            # Optional: Add a version message
+            "message": "Updated via Jenkins job"
+        },
+        # Keep the same title
+        "title": args.page_title,
+        "body": {
+            # Use Confluence Storage Format
+            "representation": "storage",
+            # New content to replace the old content
+            "value": new_content
+        }
+    }
+    logger.debug("Updating page at {}".format(endpoint))
+    logger.debug("Payload: {}".format(payload))
+    # Send update request
+    response = requests.put(
+        endpoint,
+        json=payload,
+        auth=auth,
+        headers={"Content-Type": "application/json"}
+    )
+    logger.debug("Response status code: {}".format(response.status_code))
+    # Check for errors
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        logger.error("HTTP Error: {}".format(err))
+        logger.error("Response content: {}".format(response.text))
+        raise
+    return response
+
+
+def csv_to_html(file_path):
+    """
+    Convert a CSV file to an HTML table.
+    """
+    html = "<table>\n"
+    with open(file_path, newline='', encoding='utf-8') as csvfile:
+        reader = csv.reader(csvfile)
+        for i, row in enumerate(reader):
+            if i == 0:
+                # First row as table header
+                html += "  <thead>\n    <tr>\n"
+                html += "".join("      <th>{}</th>\n".format(col) for col in row)
+                html += "    </tr>\n  </thead>\n"
+                html += "  <tbody>\n"
+            else:
+                # Data rows
+                html += "    <tr>\n"
+                html += "".join("      <td>{}</td>\n".format(col) for col in row)
+                html += "    </tr>\n"
+    html += "  </tbody>\n</table>"
+    return html
+
+
+if __name__ == "__main__":
+    logger.debug("Starting script execution")
+    # Authentication
+    auth = HTTPBasicAuth(args.email, args.token)
+    logger.debug("Using authentication for user: {}".format(args.email))
+    # Read content from the file and convert it  from csv to html
+    logger.debug("Reading content from file: {}".format(args.file))
+    new_content = csv_to_html(args.file)
+    logger.debug("Successfully converted CSV to HTML content")
+    try:
+        # Get page ID and version
+        logger.debug("Fetching page ID and version for title: {}".format(args.page_title))
+        page_id, current_version = get_page_id(args.page_title, args.confluence_url, auth)
+        logger.info("Found page ID: {}, Current version: {}".format(page_id, current_version))
+        # Update the page with new content
+        logger.debug("Updating page {} with new content".format(page_id))
+        response = update_page(page_id, current_version, new_content, args.confluence_url)
+        logger.info("Success! Page updated. Status code: {}".format(response.status_code))
+    except Exception as err:
+        logger.error("Error: {}".format(err))
